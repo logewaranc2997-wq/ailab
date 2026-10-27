@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""
+Smart Queue Prediction System
+-----------------------------
+Predicts how long a customer will wait, forecasts demand for upcoming hours,
+and recommends how many service counters to open. Pure standard library
+(Python 3.8+), so nothing needs to be installed.
+
+How the predictions work
+  * Wait-time projection : the current queue is replayed forward using the
+                           learned average service time (an exponentially
+                           weighted moving average that improves as customers
+                           are served). An 80% range is shown with each estimate.
+  * Demand forecast      : an hourly arrival profile that is updated every day
+                           with exponential smoothing and blended with the
+                           live arrival rate for the current hour.
+  * Staffing advice      : Erlang C (M/M/c queueing theory) finds the smallest
+                           number of counters that keeps the expected wait
+                           below your target.
+  * Accuracy tracking    : every prediction is compared with the real wait, and
+                           a simulator lets you test the model on synthetic days.
+
+Run:
+    python smart_queue_prediction.py              # interactive menu
+    python smart_queue_prediction.py --simulate   # run a demo simulation only
+
+State is saved to queue_state.json next to the script.
+"""
+
+import argparse
+import heapq
+import json
+import math
+import os
+import random
+import statistics
+import sys
+import time
+from datetime import datetime
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_state.json")
+
+DEFAULT_MEAN_SERVICE = 5.0   # minutes, used until real data is available
+ALPHA_SERVICE = 0.2          # smoothing for the service time average
+ALPHA_PROFILE = 0.3          # smoothing for the hourly demand profile
+Z_80 = 1.28                  # z-score for an 80% interval
+
+# Typical customers-per-hour shape of a service desk / bank branch (starting guess).
+DEFAULT_PROFILE = [0, 0, 0, 0, 0, 0, 0, 0,
+                   10, 18, 25, 30, 35, 28, 22, 20, 24, 15,
+                   6, 0, 0, 0, 0, 0]
+
+
+# --------------------------------------------------------------------------- #
+# Queueing maths
+# --------------------------------------------------------------------------- #
+def erlang_c(servers, traffic):
+    """Probability that an arriving customer has to wait (M/M/c)."""
+    if traffic >= servers:
+        return 1.0
+    term, total = 1.0, 1.0           # k = 0 term
+    for k in range(1, servers):
+        term *= traffic / k
+        total += term
+    term *= traffic / servers        # a^c / c!
+    top = term * servers / (servers - traffic)
+    return top / (total + top)
+
+
+def expected_wait_mmc(rate_per_hour, mean_service, servers):
+    """Average wait in queue (minutes) for an M/M/c system. inf if overloaded."""
+    if rate_per_hour <= 0:
+        return 0.0
+    lam = rate_per_hour / 60.0       # per minute
+    mu = 1.0 / mean_service
+    if lam / mu >= servers:
+        return math.inf
+    return erlang_c(servers, lam / mu) / (servers * mu - lam)
+
+
+def recommend_servers(rate_per_hour, mean_service, target_wait, max_servers=40):
+    for c in range(1, max_servers + 1):
+        if expected_wait_mmc(rate_per_hour, mean_service, c) <= target_wait:
+            return c
+    return max_servers
+
+
+def project_wait(now, in_service_starts, n_waiting, servers, mean_service):
+    """
+    Replay the current system forward to estimate when a new arrival would start.
+    Customers being served are assumed to be partly done (a compromise between
+    'memoryless' and 'fixed-length' service); waiting ones take the mean time.
+    """
+    free = []
+    for start in in_service_starts:
+        remaining = max(mean_service - 0.5 * (now - start), 0.3 * mean_service)
+        free.append(now + remaining)
+    free += [now] * max(0, servers - len(in_service_starts))
+    heapq.heapify(free)
+    for _ in range(n_waiting):
+        t = heapq.heappop(free)
+        heapq.heappush(free, t + mean_service)
+    return max(heapq.heappop(free) - now, 0.0)
+
+
+def wait_interval(wait, n_ahead, servers, std_service):
+    """Rough 80% range around a wait estimate."""
+    spread = Z_80 * std_service * math.sqrt(n_ahead / max(servers, 1) + 1)
+    return max(wait - spread, 0.0), wait + spread
+
+
+# --------------------------------------------------------------------------- #
+# Formatting helpers
+# --------------------------------------------------------------------------- #
+def fmt_min(m):
+    if m == math.inf:
+        return "unbounded (overloaded)"
+    return f"{m:.1f} min"
+
+
+def clock_str(now_min):
+    return datetime.fromtimestamp(now_min * 60).strftime("%H:%M")
+
+
+def header(title):
+    print("\n" + "=" * 62)
+    print(f"  {title}")
+    print("=" * 62)
+
+
+def ask(prompt, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    val = input(f"{prompt}{suffix}: ").strip()
+    return val if val else (default if default is not None else "")
+
+
+def ask_float(prompt, default, lo=0.0, hi=10_000.0):
+    while True:
+        try:
+            v = float(ask(prompt, default))
+            if lo <= v <= hi:
+                return v
+        except ValueError:
+            pass
+        print(f"  Enter a number between {lo} and {hi}.")
+
+
+def ask_int(prompt, default, lo=1, hi=10_000):
+    return int(ask_float(prompt, default, lo, hi))
+
+
+# --------------------------------------------------------------------------- #
+# Live queue system
+# --------------------------------------------------------------------------- #
+class SmartQueue:
+    SAVED = ["servers", "target_wait", "queue", "serving", "next_id", "mean_service",
+             "service_times", "profile", "counts", "counts_date", "offset", "pred_log"]
+
+    def __init__(self):
+        self.servers = 2
+        self.target_wait = 5.0
+        self.queue = []              # {"id","name","arrived","predicted"}
+        self.serving = []            # {"id","name","arrived","start"}
+        self.next_id = 1
+        self.mean_service = DEFAULT_MEAN_SERVICE
+        self.service_times = []      # recent real service durations
+        self.profile = list(DEFAULT_PROFILE)
+        self.counts = [0] * 24
+        self.counts_date = None
+        self.offset = 0.0            # demo clock shift in minutes
+        self.pred_log = []           # [predicted, actual] pairs
+
+    # ----- persistence ------------------------------------------------------
+    def save(self):
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({k: getattr(self, k) for k in self.SAVED}, f, indent=2)
+
+    @classmethod
+    def load(cls):
+        q = cls()
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    for k, v in json.load(f).items():
+                        if k in cls.SAVED:
+                            setattr(q, k, v)
+            except (OSError, json.JSONDecodeError):
+                print("! Could not read saved state, starting fresh.")
+        return q
+
+    # ----- clock ------------------------------------------------------------
+    def now(self):
+        return time.time() / 60.0 + self.offset
+
+    def _hour(self, now):
+        return datetime.fromtimestamp(now * 60).hour
+
+    def _roll_day(self, now):
+        today = datetime.fromtimestamp(now * 60).date().isoformat()
+        if self.counts_date != today:
+            if self.counts_date is not None:
+                for h in range(24):
+                    self.profile[h] = (ALPHA_PROFILE * self.counts[h]
+                                       + (1 - ALPHA_PROFILE) * self.profile[h])
+            self.counts = [0] * 24
+            self.counts_date = today
+
+    # ----- statistics -------------------------------------------------------
+    def std_service(self):
+        if len(self.service_times) >= 3:
+            return max(statistics.pstdev(self.service_times), 0.5)
+        return self.mean_service * 0.6
+
+    def predict_new_wait(self, now=None):
+        now = self.now() if now is None else now
+        starts = [c["start"] for c in self.serving]
+        wait = project_wait(now, starts, len(self.queue), self.servers, self.mean_service)
+        lo, hi = wait_interval(wait, len(self.queue), self.servers, self.std_service())
+        return wait, lo, hi
+
+    def forecast_rate(self, hour, now):
+        rate = self.profile[hour]
+        if hour == self._hour(now):
+            frac = datetime.fromtimestamp(now * 60).minute / 60.0
+            if frac >= 0.25:
+                observed = self.counts[hour] / frac
+                rate = frac * observed + (1 - frac) * rate
+        return rate
+
+    # ----- operations -------------------------------------------------------
+    def join(self, name):
+        now = self.now()
+        self._roll_day(now)
+        self.counts[self._hour(now)] += 1
+        wait, lo, hi = self.predict_new_wait(now)
+        cust = {"id": self.next_id, "name": name, "arrived": now, "predicted": wait}
+        self.next_id += 1
+        self.queue.append(cust)
+        return cust, wait, lo, hi
+
+    def call_next(self):
+        if not self.queue:
+            return None, "Queue is empty."
+        if len(self.serving) >= self.servers:
+            return None, "All counters are busy. Complete a service first."
+        now = self.now()
+        cust = self.queue.pop(0)
+        actual = now - cust["arrived"]
+        self.pred_log.append([cust["predicted"], actual])
+        self.pred_log = self.pred_log[-200:]
+        cust["start"] = now
+        self.serving.append(cust)
+        return cust, actual
+
+    def complete(self, cust_id):
+        for c in self.serving:
+            if c["id"] == cust_id:
+                dur = self.now() - c["start"]
+                self.serving.remove(c)
+                self.service_times = (self.service_times + [dur])[-300:]
+                self.mean_service = ALPHA_SERVICE * dur + (1 - ALPHA_SERVICE) * self.mean_service
+                return c, dur
+        return None, 0.0
+
+    # ----- reports ----------------------------------------------------------
+    def status(self):
+        now = self.now()
+        header(f"LIVE STATUS  -  clock {clock_str(now)}")
+        print(f"Counters open : {self.servers}   (busy: {len(self.serving)})")
+        print(f"Avg service   : {self.mean_service:.1f} min (learned from {len(self.service_times)} services)")
+        print(f"Waiting       : {len(self.queue)} customer(s)")
+        if self.serving:
+            print("\nBeing served:")
+            for c in self.serving:
+                print(f"  #{c['id']:<4} {c['name']:<16} for {now - c['start']:.1f} min")
+        if self.queue:
+            print("\nWaiting line (predicted time until served):")
+            starts = [c["start"] for c in self.serving]
+            for i, c in enumerate(self.queue):
+                w = project_wait(now, starts, i, self.servers, self.mean_service)
+                print(f"  {i + 1}. #{c['id']:<4} {c['name']:<16} ~{fmt_min(w)}")
+        wait, lo, hi = self.predict_new_wait(now)
+        print(f"\nA customer joining now would wait about {fmt_min(wait)} "
+              f"(80% range {lo:.1f}-{hi:.1f} min).")
+
+    def accuracy(self):
+        if not self.pred_log:
+            return None
+        errs = [abs(p - a) for p, a in self.pred_log]
+        return {"n": len(errs), "mae": statistics.mean(errs),
+                "within3": 100 * sum(e <= 3 for e in errs) / len(errs)}
+
+    def forecast(self, hours=6):
+        now = self.now()
+        self._roll_day(now)
+        cur = self._hour(now)
+        header("DEMAND FORECAST & STAFFING ADVICE")
+        print(f"Target average wait: {self.target_wait:.1f} min | avg service: {self.mean_service:.1f} min\n")
+        print(f"{'Hour':<8}{'Cust/hr':>9}{'Utilization':>13}{'Wait @ now':>13}{'Counters needed':>17}")
+        for i in range(hours):
+            h = (cur + i) % 24
+            rate = self.forecast_rate(h, now)
+            util = rate / 60.0 * self.mean_service / self.servers * 100
+            w = expected_wait_mmc(rate, self.mean_service, self.servers)
+            need = recommend_servers(rate, self.mean_service, self.target_wait)
+            w_txt = "overload" if w == math.inf else f"{w:.1f} min"
+            flag = "  <- add counters" if need > self.servers else ""
+            print(f"{h:02d}:00   {rate:>9.1f}{util:>12.0f}%{w_txt:>13}{need:>17}{flag}")
+        peak_h = max(range(24), key=lambda h: self.profile[h])
+        print(f"\nBusiest hour of the day (learned profile): {peak_h:02d}:00 "
+              f"with about {self.profile[peak_h]:.0f} customers/hour.")
+
+
+# --------------------------------------------------------------------------- #
+# Simulator (tests the predictor on a synthetic day)
+# --------------------------------------------------------------------------- #
+def simulate(servers=3, true_mean=6.0, assumed_mean=4.0, profile=None,
+             start_hour=8, end_hour=18, seed=None, scale=1.0):
+    """
+    FCFS multi-server day. The predictor starts with a wrong guess of the mean
+    service time (assumed_mean) and learns it as customers finish.
+    """
+    rng = random.Random(seed)
+    profile = profile or DEFAULT_PROFILE
+    arrivals = []
+    for h in range(start_hour, end_hour):
+        rate = profile[h] * scale / 60.0
+        if rate <= 0:
+            continue
+        t = h * 60.0
+        while True:
+            t += rng.expovariate(rate)
+            if t >= (h + 1) * 60:
+                break
+            arrivals.append(t)
+
+    free = [0.0] * servers
+    heapq.heapify(free)
+    active = []                       # (start, end) of customers not yet finished
+    est_mean = assumed_mean
+    rows = []                         # (arrival, predicted, actual)
+    for t in arrivals:
+        for s, e in [a for a in active if a[1] <= t]:
+            est_mean = ALPHA_SERVICE * (e - s) + (1 - ALPHA_SERVICE) * est_mean
+        active = [a for a in active if a[1] > t]
+
+        in_service = [s for s, e in active if s <= t]
+        waiting = sum(1 for s, e in active if s > t)
+        predicted = project_wait(t, in_service, waiting, servers, est_mean)
+
+        earliest = heapq.heappop(free)
+        start = max(t, earliest)
+        end = start + rng.expovariate(1.0 / true_mean)
+        heapq.heappush(free, end)
+        active.append((start, end))
+        rows.append((t, predicted, start - t))
+    return rows
+
+
+def simulation_report(rows, servers, true_mean, assumed_mean):
+    if not rows:
+        print("  No customers were generated.")
+        return
+    preds = [r[1] for r in rows]
+    acts = [r[2] for r in rows]
+    errs = [abs(p - a) for p, a in zip(preds, acts)]
+    acts_sorted = sorted(acts)
+    p90 = acts_sorted[int(0.9 * (len(acts_sorted) - 1))]
+    header("SIMULATION RESULTS")
+    print(f"Customers simulated : {len(rows)}   Counters: {servers}")
+    print(f"True mean service   : {true_mean:.1f} min (model started by assuming {assumed_mean:.1f})")
+    print(f"Average real wait   : {statistics.mean(acts):.1f} min   90th percentile: {p90:.1f} min")
+    print(f"Prediction error    : {statistics.mean(errs):.2f} min average (MAE)")
+    print(f"Within 3 minutes    : {100 * sum(e <= 3 for e in errs) / len(errs):.0f}% of predictions")
+    print(f"Within 5 minutes    : {100 * sum(e <= 5 for e in errs) / len(errs):.0f}% of predictions")
+
+    print("\nBy hour (avg real wait vs avg predicted):")
+    by_hour = {}
+    for t, p, a in rows:
+        by_hour.setdefault(int(t // 60), []).append((p, a))
+    for h in sorted(by_hour):
+        ps = statistics.mean(x[0] for x in by_hour[h])
+        as_ = statistics.mean(x[1] for x in by_hour[h])
+        bar = "#" * int(as_)
+        print(f"  {h:02d}:00  n={len(by_hour[h]):<3} real {as_:5.1f}  pred {ps:5.1f}  {bar}")
+
+
+def run_simulation_menu():
+    header("SIMULATION")
+    servers = ask_int("Number of counters", 3, 1, 30)
+    true_mean = ask_float("True average service time (min)", 6.0, 0.5, 120)
+    assumed = ask_float("Model's initial guess of service time (min)", 4.0, 0.5, 120)
+    scale = ask_float("Demand multiplier (1.0 = normal)", 1.0, 0.1, 5)
+    seed = ask("Random seed (blank = random)", "")
+    rows = simulate(servers, true_mean, assumed, seed=int(seed) if seed else None, scale=scale)
+    simulation_report(rows, servers, true_mean, assumed)
+
+    peak_rate = max(DEFAULT_PROFILE) * scale
+    need = recommend_servers(peak_rate, true_mean, 5.0)
+    print(f"\nAdvice: for the peak hour (~{peak_rate:.0f} customers/hr) keep about {need} "
+          f"counter(s) open to hold the average wait under 5 minutes.")
+
+
+# --------------------------------------------------------------------------- #
+# Interactive menu
+# --------------------------------------------------------------------------- #
+def menu():
+    q = SmartQueue.load()
+    while True:
+        header("SMART QUEUE PREDICTION SYSTEM")
+        print(f"  Clock {clock_str(q.now())} | waiting: {len(q.queue)} | "
+              f"serving: {len(q.serving)}/{q.servers} | avg service {q.mean_service:.1f} min\n")
+        print("1) Customer joins queue (get wait prediction)\n"
+              "2) Call next customer to a free counter\n"
+              "3) Complete a service\n"
+              "4) Live status\n"
+              "5) Demand forecast & staffing advice\n"
+              "6) Prediction accuracy so far\n"
+              "7) Run simulation\n"
+              "8) Settings (counters, target wait)\n"
+              "9) Fast-forward clock (demo)\n"
+              "0) Save & exit")
+        choice = ask("Choose")
+        try:
+            if choice == "1":
+                name = ask("Customer name", f"Customer {q.next_id}")
+                c, w, lo, hi = q.join(name)
+                print(f"\n  Ticket #{c['id']} issued to {c['name']}. Position in line: {len(q.queue)}.")
+                print(f"  Estimated wait: {fmt_min(w)}  (80% range {lo:.1f}-{hi:.1f} min)")
+                print(f"  Expected service start around {clock_str(q.now() + w)}.")
+            elif choice == "2":
+                c, info = q.call_next()
+                if c:
+                    print(f"\n  Now serving #{c['id']} {c['name']}. They waited {info:.1f} min "
+                          f"(predicted {c['predicted']:.1f}).")
+                else:
+                    print(f"  {info}")
+            elif choice == "3":
+                if not q.serving:
+                    print("  Nobody is being served.")
+                else:
+                    for c in q.serving:
+                        print(f"  #{c['id']} {c['name']}")
+                    cid = ask_int("Ticket number to complete", q.serving[0]["id"], 1, 10**9)
+                    c, dur = q.complete(cid)
+                    if c:
+                        print(f"  Done. Service took {dur:.1f} min; average updated to {q.mean_service:.1f} min.")
+                    else:
+                        print("  Ticket not found.")
+            elif choice == "4":
+                q.status()
+            elif choice == "5":
+                q.forecast(ask_int("Hours to forecast", 6, 1, 24))
+            elif choice == "6":
+                acc = q.accuracy()
+                if not acc:
+                    print("  No data yet - serve a few customers first.")
+                else:
+                    print(f"  Based on {acc['n']} customers: average error {acc['mae']:.2f} min, "
+                          f"{acc['within3']:.0f}% within 3 minutes.")
+            elif choice == "7":
+                run_simulation_menu()
+            elif choice == "8":
+                q.servers = ask_int("Counters open", q.servers, 1, 100)
+                q.target_wait = ask_float("Target average wait (min)", q.target_wait, 0.5, 120)
+            elif choice == "9":
+                q.offset += ask_float("Minutes to advance", 5, 0.1, 1440)
+                print(f"  Clock is now {clock_str(q.now())}.")
+            elif choice == "0":
+                q.save()
+                print("State saved. Goodbye!")
+                return
+        except (KeyboardInterrupt, EOFError):
+            print("\n(back to menu)")
+        q.save()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Smart Queue Prediction System")
+    parser.add_argument("--simulate", action="store_true", help="run a demo simulation and exit")
+    args = parser.parse_args()
+    if args.simulate:
+        rows = simulate(servers=3, true_mean=6.0, assumed_mean=4.0, seed=42)
+        simulation_report(rows, 3, 6.0, 4.0)
+        return
+    menu()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nGoodbye!")
+        sys.exit(0)
